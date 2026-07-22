@@ -1,0 +1,51 @@
+name: Build
+
+on:
+  push:
+    branches: [ "main" ]
+    paths-ignore:
+      - '**.md'
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: 'gradle'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build with Gradle
+        run: |
+          chmod +x ./gradlew
+          ./gradlew zipRelease zipDebug -Porg.gradle.parallel=true
+
+      - name: Prepare artifact
+        id: prepareArtifact
+        run: |
+          set -e
+          RELEASE_FILE=$(find out -name "*Release*.zip" | head -1)
+          RELEASE_NAME=$(basename "$RELEASE_FILE" .zip)
+          echo "releaseName=$RELEASE_NAME" >> $GITHUB_OUTPUT
+          mkdir -p module-release
+          unzip -q "$RELEASE_FILE" -d module-release
+
+      - name: Upload release
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepareArtifact.outputs.releaseName }}
+          path: "./module-release/*"
