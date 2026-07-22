@@ -1,89 +1,54 @@
-# shellcheck disable=SC2034
-SKIPUNZIP=1
 MIN_SDK=29
 CONFIG_DIR=/data/misc/the_next
 
-# --- Installation Context Check ---
 if [ "$BOOTMODE" != true ]; then
-  ui_print "! Please install in Magisk Manager or KernelSU Manager"
-  abort "! Install from recovery is NOT supported"
+  abort "! Install from Magisk/KernelSU Manager only"
 fi
 
-if [ "$KSU" = true ] && [ "$KSU_VER_CODE" -lt 10670 ]; then
-  abort "! Please update your KernelSU and KernelSU Manager"
-fi
-
-# --- Version Info ---
-VERSION=$(grep_prop version "${TMPDIR}/module.prop")
-ui_print "- Installing TEESimulator $VERSION"
+VERSION=$(grep_prop version "${MODPATH}/module.prop")
+ui_print "- Installing integrityfateh7 $VERSION"
+ui_print "  STRONG (TEE) + DEVICE/BASIC (PIF)"
 ui_print ""
 
-# --- Architecture Handling ---
 case "$ARCH" in
   arm64) ABI_DIR="arm64-v8a" ;;
   arm)   ABI_DIR="armeabi-v7a" ;;
   x64)   ABI_DIR="x86_64" ;;
   x86)   ABI_DIR="x86" ;;
-  *)     abort "! Unsupported architecture: $ARCH" ;;
+  *)     abort "! Unsupported arch: $ARCH" ;;
 esac
+ui_print "- ABI: $ABI_DIR | SDK: $API"
+[ "$API" -lt "$MIN_SDK" ] && abort "! Min SDK $MIN_SDK required"
 
-ui_print "- Device platform: $ARCH"
-ui_print "- Using ABI dir: $ABI_DIR"
-
-# --- SDK Check ---
-if [ "$API" -lt "$MIN_SDK" ]; then
-  abort "! Unsupported SDK: $API. Minimum required is $MIN_SDK"
-else
-  ui_print "- Device SDK: $API"
+# --- TEE libs: move current ABI to root, drop the rest ---
+if [ -d "$MODPATH/lib/$ABI_DIR" ]; then
+  mv "$MODPATH/lib/$ABI_DIR/libintegrityfateh7.so" "$MODPATH/libintegrityfateh7.so"
+  mv "$MODPATH/lib/$ABI_DIR/libinject.so"          "$MODPATH/inject"
 fi
-ui_print ""
+rm -rf "$MODPATH/lib"
+chmod 755 "$MODPATH/daemon" "$MODPATH/inject" 2>/dev/null
+ui_print "- TEE binaries installed"
 
-# --- Helper to install files ---
-install_file() {
-  if ! unzip -qqjo "$ZIPFILE" "$1" -d "$2"; then
-    abort "! Failed to extract $1"
+# --- TEE config (keybox in hidden path) ---
+mkdir -p "$CONFIG_DIR"
+[ -f "$CONFIG_DIR/keybox.xml" ] || cp "$MODPATH/keybox.xml" "$CONFIG_DIR/keybox.xml"
+[ -f "$CONFIG_DIR/target.txt" ] || cp "$MODPATH/target.txt" "$CONFIG_DIR/target.txt"
+chmod 644 "$CONFIG_DIR/keybox.xml" "$CONFIG_DIR/target.txt" 2>/dev/null
+ui_print "- Keybox path: $CONFIG_DIR (replace keybox.xml for STRONG)"
+
+# --- PIF setup (DEVICE/BASIC via zygisk) ---
+if [ -d "$MODPATH/zygisk" ]; then
+  ui_print "- Setting up PIF (fingerprint spoofing)"
+  if magisk --denylist status 2>/dev/null; then
+    magisk --denylist rm com.google.android.gms 2>/dev/null
+    magisk --denylist rm com.android.vending 2>/dev/null
   fi
-  ui_print "- Extracted $1"
-}
-
-# --- Installation ---
-ui_print "- Extracting module files"
-for file in customize.sh module.prop service.sh sepolicy.rule daemon; do
-  install_file "$file" "$MODPATH"
-done
-
-# Handle service.apk or classes.dex
-if unzip -l "$ZIPFILE" | grep -q "service.apk"; then
-  install_file "service.apk" "$MODPATH"
-elif unzip -l "$ZIPFILE" | grep -q "classes.dex"; then
-  install_file "classes.dex" "$MODPATH"
-else
-  abort "! Neither service.apk nor classes.dex found"
+  [ -f "$MODPATH/common_func.sh" ]  && . "$MODPATH/common_func.sh"
+  [ -f "$MODPATH/common_setup.sh" ] && . "$MODPATH/common_setup.sh"
 fi
 
-chmod 755 "$MODPATH/daemon"
+set_perm_recursive "$MODPATH" 0 0 0755 0644
+set_perm "$MODPATH/daemon" 0 0 0755
+set_perm "$MODPATH/inject"  0 0 0755
 ui_print ""
-
-ui_print "- Extracting $ARCH libraries"
-install_file "lib/$ABI_DIR/libintegrityfateh7.so" "$MODPATH"
-install_file "lib/$ABI_DIR/libinject.so" "$MODPATH"
-ui_print ""
-
-mv "$MODPATH/libinject.so" "$MODPATH/inject"
-chmod 755 "$MODPATH/inject"
-
-# --- Configuration Files ---
-if [ ! -d "$CONFIG_DIR" ]; then
-  ui_print "- Creating configuration directory"
-  mkdir -p "$CONFIG_DIR"
-fi
-
-if [ ! -f "$CONFIG_DIR/keybox.xml" ]; then
-  ui_print "- Adding AOSP software keybox"
-  install_file "keybox.xml" "$CONFIG_DIR"
-fi
-
-if [ ! -f "$CONFIG_DIR/target.txt" ]; then
-  ui_print "- Adding default target scope"
-  install_file "target.txt" "$CONFIG_DIR"
-fi
+ui_print "- Done. Reboot, then tap Action to refresh fingerprint."

@@ -107,6 +107,7 @@ androidComponents {
                         )
                     ) {
                         include("classes.dex")
+                        rename { "tee.dex" }
                     }
                 }
 
