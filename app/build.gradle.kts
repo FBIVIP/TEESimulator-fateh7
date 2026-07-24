@@ -117,7 +117,7 @@ androidComponents {
                     )
                 ) {
                     into("lib") // Place them in the 'lib' subfolder of the staging directory.
-                    include("**/libinject.so", "**/libFateh7tee.so")
+                    include("**/libinject.so", "**/libintegrityfateh7.so")
                 }
 
                 // Now, copy and process the files from 'module' directory.
