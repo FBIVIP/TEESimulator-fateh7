@@ -21,14 +21,17 @@ import org.matrix.TEESimulator.interception.keystore.shim.KeyMintSecurityLevelIn
  * is hosted by the same keystore2 process, so the already-injected native hook reaches it too.
  */
 object Keystore2MaintenanceInterceptor : BinderInterceptor() {
-    private val stubClass = IKeystoreMaintenance.Stub::class.java
+    // Load the REAL framework Stub at runtime (the compileOnly stub carries no TRANSACTION_* codes).
+    private val stubClass: Class<*>? = runCatching {
+        Class.forName("android.security.maintenance.IKeystoreMaintenance\$Stub")
+    }.getOrNull()
 
     private val CLEAR_NAMESPACE_TRANSACTION =
-        InterceptorUtils.getTransactCode(stubClass, "clearNamespace")
+        stubClass?.let { InterceptorUtils.getTransactCode(it, "clearNamespace") } ?: -1
     private val DELETE_ALL_KEYS_TRANSACTION =
-        InterceptorUtils.getTransactCode(stubClass, "deleteAllKeys")
+        stubClass?.let { InterceptorUtils.getTransactCode(it, "deleteAllKeys") } ?: -1
     private val MIGRATE_KEY_NAMESPACE_TRANSACTION =
-        InterceptorUtils.getTransactCode(stubClass, "migrateKeyNamespace")
+        stubClass?.let { InterceptorUtils.getTransactCode(it, "migrateKeyNamespace") } ?: -1
 
     /** Only the lifecycle transactions we mirror; unresolved codes (-1) are dropped. */
     val interceptedCodes: IntArray by lazy {
