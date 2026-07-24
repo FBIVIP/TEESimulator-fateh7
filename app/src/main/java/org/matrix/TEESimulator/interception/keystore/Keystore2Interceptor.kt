@@ -56,7 +56,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
 
     override val serviceName = "android.system.keystore2.IKeystoreService/default"
     override val processName = "keystore2"
-    override val injectionCommand = "exec ./inject `pidof keystore2` libFateh7tee.so entry"
+    override val injectionCommand = "exec ./inject `pidof keystore2` libintegrityfateh7.so entry"
 
     /**
      * This method is called once the main service is hooked. It proceeds to find and hook the
