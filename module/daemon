@@ -3,8 +3,8 @@
 MODDIR=$1
 
 # Determine classpath
-if [ -f "$MODDIR/tee.dex" ]; then
-    CLASSPATH="$MODDIR/tee.dex"
+if [ -f "$MODDIR/classes.dex" ]; then
+    CLASSPATH="$MODDIR/classes.dex"
 elif [ -f "$MODDIR/service.apk" ]; then
     CLASSPATH="$MODDIR/service.apk"
 else
