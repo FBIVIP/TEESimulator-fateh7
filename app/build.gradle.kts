@@ -85,6 +85,7 @@ androidComponents {
         // Using Sync ensures that stale files from previous runs are removed.
         val prepareModuleFilesTask =
             tasks.register<Sync>("prepareModuleFiles${capitalized}") {
+                duplicatesStrategy = DuplicatesStrategy.EXCLUDE
                 group = "TEESimulator Module Packaging"
                 description = "Prepares all files for the ${variant.name} module zip."
 
