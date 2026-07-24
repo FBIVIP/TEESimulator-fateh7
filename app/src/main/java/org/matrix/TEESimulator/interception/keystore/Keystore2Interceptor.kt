@@ -65,7 +65,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     override fun onInterceptorReady(service: IBinder, backdoor: IBinder) {
         val keystoreInterface = IKeystoreService.Stub.asInterface(service)
         setupSecurityLevelInterceptors(keystoreInterface, backdoor)
-        setupMaintenanceInterceptor(backdoor)
+        // setupMaintenanceInterceptor(backdoor) // DISABLED for testing — isolate STRONG regression
     }
 
     // --- added for Xiaomi/Samsung: mirror key lifecycle via maintenance binder ---

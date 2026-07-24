@@ -5,6 +5,7 @@ import android.os.Parcel
 import android.security.maintenance.IKeystoreMaintenance
 import android.system.keystore2.Domain
 import org.matrix.TEESimulator.interception.core.BinderInterceptor
+import org.matrix.TEESimulator.util.SystemLogger
 import org.matrix.TEESimulator.interception.keystore.shim.KeyMintSecurityLevelInterceptor
 
 /**
@@ -40,11 +41,13 @@ object Keystore2MaintenanceInterceptor : BinderInterceptor() {
         callingPid: Int,
         data: Parcel,
     ): TransactionResult {
-        when (code) {
-            CLEAR_NAMESPACE_TRANSACTION -> handleClearNamespace(data)
-            DELETE_ALL_KEYS_TRANSACTION ->
-                KeyMintSecurityLevelInterceptor.clearAllGeneratedKeys("maintenance.deleteAllKeys")
-        }
+        runCatching {
+            when (code) {
+                CLEAR_NAMESPACE_TRANSACTION -> handleClearNamespace(data)
+                DELETE_ALL_KEYS_TRANSACTION ->
+                    KeyMintSecurityLevelInterceptor.clearAllGeneratedKeys("maintenance.deleteAllKeys")
+            }
+        }.onFailure { SystemLogger.error("maintenance onPreTransact failed", it) }
         return TransactionResult.ContinueAndSkipPost
     }
 
