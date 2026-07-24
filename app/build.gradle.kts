@@ -107,7 +107,6 @@ androidComponents {
                         )
                     ) {
                         include("classes.dex")
-                        rename { "tee.dex" }
                     }
                 }
 
@@ -117,7 +116,7 @@ androidComponents {
                     )
                 ) {
                     into("lib") // Place them in the 'lib' subfolder of the staging directory.
-                    include("**/libinject.so", "**/libintegrityfateh7.so")
+                    include("**/libinject.so", "**/libFateh7tee.so")
                 }
 
                 // Now, copy and process the files from 'module' directory.

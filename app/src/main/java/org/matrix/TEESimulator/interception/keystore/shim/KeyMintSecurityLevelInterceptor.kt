@@ -394,6 +394,23 @@ class KeyMintSecurityLevelInterceptor(
             attestationKeys.clear()
             SystemLogger.info("Cleared all cached keys ($count entries)$reasonMessage.")
         }
+
+        // --- added for Xiaomi/Samsung support (maintenance interceptor) ---
+        fun migrateGeneratedKey(srcId: KeyIdentifier, dstId: KeyIdentifier) {
+            if (srcId == dstId || generatedKeys.containsKey(dstId)) return
+            val info = generatedKeys.remove(srcId) ?: return
+            generatedKeys[dstId] = info
+            if (attestationKeys.remove(srcId)) attestationKeys.add(dstId)
+            patchedChains.remove(srcId)?.let { patchedChains[dstId] = it }
+            SystemLogger.info("Migrated synthetic key $srcId -> $dstId (maintenance.migrateKeyNamespace)")
+        }
+
+        fun clearNamespaceKeys(uid: Int) {
+            val victims = generatedKeys.keys.filter { it.uid == uid }
+            if (victims.isEmpty()) return
+            victims.forEach { cleanupKeyData(it) }
+            SystemLogger.info("Cleared ${victims.size} synthetic keys for uid=$uid (maintenance.clearNamespace)")
+        }
     }
 }
 

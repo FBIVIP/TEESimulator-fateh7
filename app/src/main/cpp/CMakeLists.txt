@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(TEESimulator)
+project(Fateh7tee)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -23,7 +23,6 @@ target_include_directories(libinject.so PUBLIC include)
 target_link_libraries(libinject.so PRIVATE lsplt_static)
 
 add_library(${CMAKE_PROJECT_NAME} SHARED binder_interceptor.cpp)
-set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME "integrityfateh7")
 target_include_directories(${CMAKE_PROJECT_NAME} PUBLIC external/linux-kernel/include include)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE binder lsplt_static utils)
 

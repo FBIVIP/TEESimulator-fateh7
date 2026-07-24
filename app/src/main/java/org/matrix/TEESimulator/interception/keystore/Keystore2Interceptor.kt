@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.hardware.security.keymint.SecurityLevel
 import android.os.Build
 import android.os.IBinder
+import android.os.ServiceManager
 import android.os.Parcel
 import android.system.keystore2.IKeystoreService
 import android.system.keystore2.KeyDescriptor
@@ -55,7 +56,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
 
     override val serviceName = "android.system.keystore2.IKeystoreService/default"
     override val processName = "keystore2"
-    override val injectionCommand = "exec ./inject `pidof keystore2` libintegrityfateh7.so entry"
+    override val injectionCommand = "exec ./inject `pidof keystore2` libFateh7tee.so entry"
 
     /**
      * This method is called once the main service is hooked. It proceeds to find and hook the
@@ -64,6 +65,19 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     override fun onInterceptorReady(service: IBinder, backdoor: IBinder) {
         val keystoreInterface = IKeystoreService.Stub.asInterface(service)
         setupSecurityLevelInterceptors(keystoreInterface, backdoor)
+        setupMaintenanceInterceptor(backdoor)
+    }
+
+    // --- added for Xiaomi/Samsung: mirror key lifecycle via maintenance binder ---
+    private fun setupMaintenanceInterceptor(backdoor: IBinder) {
+        runCatching {
+                ServiceManager.getService("android.security.maintenance")?.let { maintenance ->
+                    SystemLogger.info("Found maintenance binder. Registering interceptor...")
+                    register(backdoor, maintenance, Keystore2MaintenanceInterceptor)
+                }
+                    ?: SystemLogger.warning("Maintenance binder not found; skipping lifecycle parity.")
+            }
+            .onFailure { SystemLogger.error("Failed to intercept maintenance binder.", it) }
     }
 
     private fun setupSecurityLevelInterceptors(service: IKeystoreService, backdoor: IBinder) {
