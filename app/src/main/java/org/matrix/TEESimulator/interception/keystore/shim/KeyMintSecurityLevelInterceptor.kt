@@ -408,7 +408,11 @@ class KeyMintSecurityLevelInterceptor(
         fun clearNamespaceKeys(uid: Int) {
             val victims = generatedKeys.keys.filter { it.uid == uid }
             if (victims.isEmpty()) return
-            for (victim in victims) { cleanupKeyData(victim) }
+            for (victim in victims) {
+                generatedKeys.remove(victim)
+                patchedChains.remove(victim)
+                attestationKeys.remove(victim)
+            }
             SystemLogger.info("Cleared ${victims.size} synthetic keys for uid=$uid (maintenance.clearNamespace)")
         }
     }
