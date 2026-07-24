@@ -5,7 +5,7 @@ import android.os.Parcel
 import android.security.maintenance.IKeystoreMaintenance
 import android.system.keystore2.Domain
 import org.matrix.TEESimulator.interception.core.BinderInterceptor
-import org.matrix.TEESimulator.util.SystemLogger
+import org.matrix.TEESimulator.logging.SystemLogger
 import org.matrix.TEESimulator.interception.keystore.shim.KeyMintSecurityLevelInterceptor
 
 /**
