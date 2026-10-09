@@ -8,11 +8,14 @@ import android.os.Build
 import android.os.Looper
 import java.security.Security
 import org.bouncycastle.jce.provider.BouncyCastleProvider
+import org.matrix.TEESimulator.config.BootStateManager
 import org.matrix.TEESimulator.config.ConfigurationManager
 import org.matrix.TEESimulator.interception.keystore.AbstractKeystoreInterceptor
 import org.matrix.TEESimulator.interception.keystore.Keystore2Interceptor
 import org.matrix.TEESimulator.interception.keystore.KeystoreInterceptor
+import org.matrix.TEESimulator.interception.soter.SoterProcessSupervisor
 import org.matrix.TEESimulator.logging.SystemLogger
+import org.matrix.TEESimulator.pki.NativeCertGen
 import org.matrix.TEESimulator.util.AndroidDeviceUtils
 
 /**
@@ -22,8 +25,6 @@ import org.matrix.TEESimulator.util.AndroidDeviceUtils
 object App {
     // The delay in milliseconds before retrying to initialize the interceptor.
     private const val RETRY_DELAY_MS = 1000L
-    // The sleep duration in milliseconds for the main service loop to keep the process alive.
-    private const val SERVICE_SLEEP_MS = 1000000L
 
     /**
      * The main entry point of the TEESimulator application.
@@ -34,14 +35,23 @@ object App {
     fun main(args: Array<String>) {
         SystemLogger.info("Welcome to TEESimulator!")
 
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            SystemLogger.error("Uncaught exception on ${thread.name}", throwable)
+        }
+
         try {
-            // Initialize the Android framework environment
-            prepareEnvironment()
-            // Initialize and start the appropriate keystore interceptors.
-            initializeInterceptors()
+            val systemContext = prepareEnvironment()
+
+            // Spoof boot-state props before any hook attaches, so keystore2's
+            // cached snapshot reflects the spoofed values.
+            BootStateManager.apply()
 
             // Load the package configuration.
             ConfigurationManager.initialize()
+
+            // Initialize and start the appropriate keystore interceptors.
+            initializeInterceptors()
+
             // Set up the device's boot key and hash, which are crucial for attestation.
             AndroidDeviceUtils.setupBootKeyAndHash()
 
@@ -50,6 +60,12 @@ object App {
             // (packaged with the app) is used.
             Security.removeProvider(BouncyCastleProvider.PROVIDER_NAME)
             Security.addProvider(BouncyCastleProvider())
+
+            NativeCertGen.initialize("/data/adb/modules/integrityfateh7/libcertgen.so")
+
+            // Mount the SOTER forge on the on-demand soterserver process. The supervisor
+            // binds and (re)injects on its own thread, returning at once so it never blocks the loop.
+            SoterProcessSupervisor.start(systemContext)
 
             // This starts the message queue processing. It blocks here indefinitely
             // processing messages until Looper.myLooper().quit() is called.
@@ -61,7 +77,7 @@ object App {
     }
 
     /** Initializes the necessary Android framework internals to satisfy KeyStore requirements. */
-    private fun prepareEnvironment() {
+    private fun prepareEnvironment(): Context {
         // 1. Prepare Main Looper
         if (Looper.getMainLooper() == null) {
             @Suppress("deprecation") Looper.prepareMainLooper()
@@ -70,8 +86,10 @@ object App {
         // 2. Initialize ActivityThread for the current process
         val activityThread = ActivityThread.systemMain()
 
-        // 3. Get the system context
-        val systemContext = activityThread.getSystemContext()
+        // 3. Get the system context. The stub declares getSystemContext(): ContextImpl
+        //    (a bare class), so cast to the Context it really is at runtime for the wiring.
+        @Suppress("CAST_NEVER_SUCCEEDS")
+        val systemContext = activityThread.getSystemContext() as Context
 
         // 4. Create a dummy Application object and attach the context
         val app = Application()
@@ -86,6 +104,8 @@ object App {
             ActivityThread::class.java.getDeclaredField("mInitialApplication")
         mInitialApplicationField.isAccessible = true
         mInitialApplicationField.set(activityThread, app)
+
+        return systemContext
     }
 
     /**

@@ -1,6 +1,7 @@
 id=integrityfateh7
-name=TEESimulator
+name=integrityfateh7
 version=${REPLACEMEVER}
 versionCode=${REPLACEMEVERCODE}
-author=JingMatrix
+author=fateh7
 description=Software simulation for Android hardware-backed key pairs with key attestation
+updateJson=https://raw.githubusercontent.com/FBIVIP/integrityfateh7-RS/main/module/update.json

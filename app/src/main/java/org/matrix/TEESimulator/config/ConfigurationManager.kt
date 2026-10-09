@@ -29,9 +29,8 @@ object ConfigurationManager {
     }
 
     // --- Configuration Paths ---
-    const val CONFIG_PATH = "/data/misc/the_next"
+    const val CONFIG_PATH = "/data/misc/the_next_xx"
     private const val TARGET_PACKAGES_FILE = "target.txt"
-    private const val TEE_STATUS_FILE = "tee_status.txt"
     private const val PATCH_LEVEL_FILE = "security_patch.txt"
     private const val DEFAULT_KEYBOX_FILE = "keybox.xml"
     private val configRoot = File(CONFIG_PATH)
@@ -39,7 +38,6 @@ object ConfigurationManager {
     // --- In-Memory Configuration State ---
     @Volatile private var packageModes = mapOf<String, Mode>()
     @Volatile private var packageKeyboxes = mapOf<String, String>()
-    @Volatile private var isTeeBroken: Boolean? = null
     @Volatile private var globalCustomPatchLevel: CustomPatchLevel? = null
     @Volatile private var packagePatchLevels = mapOf<String, CustomPatchLevel>()
 
@@ -68,8 +66,6 @@ object ConfigurationManager {
         // Initial load of all configuration files.
         loadTargetPackages(File(configRoot, TARGET_PACKAGES_FILE))
         loadPatchLevelConfig(File(configRoot, PATCH_LEVEL_FILE))
-        storeTeeStatus() // Check and store the current TEE status.
-
         // Start watching for any subsequent file changes.
         ConfigObserver.startWatching()
         SystemLogger.info("Configuration initialized and file observer started.")
@@ -87,33 +83,43 @@ object ConfigurationManager {
         return packages.firstNotNullOfOrNull { pkg -> packageKeyboxes[pkg] } ?: DEFAULT_KEYBOX_FILE
     }
 
-    /** Determines if the certificate for a given UID needs to be patched. */
-    fun shouldPatch(uid: Int): Boolean = getPackageModeForUid(uid) == Mode.PATCH
+    fun shouldPatch(uid: Int): Boolean {
+        val mode = getPackageModeForUid(uid)
+        return mode == Mode.PATCH || mode == Mode.AUTO
+    }
 
     /** Determines if a new certificate needs to be generated for a given UID. */
     fun shouldGenerate(uid: Int): Boolean = getPackageModeForUid(uid) == Mode.GENERATE
 
-    /** Determines if no operation is needed for a given UID. */
     fun shouldSkipUid(uid: Int): Boolean = getPackageModeForUid(uid) == null
 
-    /** Resolves the operating mode for a given UID based on its packages and the TEE status. */
+    fun isAutoMode(uid: Int): Boolean {
+        for (pkg in getPackagesForUid(uid)) {
+            when (packageModes[pkg]) {
+                Mode.GENERATE,
+                Mode.PATCH -> return false
+                Mode.AUTO -> return true
+                null -> continue
+            }
+        }
+        return false
+    }
+
     private fun getPackageModeForUid(uid: Int): Mode? {
         val packages = getPackagesForUid(uid)
         if (packages.isEmpty()) return null
 
-        // Lazily load TEE status if it hasn't been checked yet.
-        if (isTeeBroken == null) loadTeeStatus()
-
-        // Find the first configured mode for any of the UID's packages.
         for (pkg in packages) {
             when (packageModes[pkg]) {
                 Mode.GENERATE -> return Mode.GENERATE
                 Mode.PATCH -> return Mode.PATCH
-                Mode.AUTO -> return if (isTeeBroken == true) Mode.GENERATE else Mode.PATCH
-                null -> continue // No config for this package, check the next one.
+                Mode.AUTO ->
+                    return if (DeviceAttestationService.isTeeFunctional) Mode.PATCH
+                    else Mode.GENERATE
+                null -> continue
             }
         }
-        return null // No configuration found for this UID.
+        return null
     }
 
     /**
@@ -171,7 +177,6 @@ object ConfigurationManager {
                         newModes[pkg] = Mode.PATCH
                         newKeyboxes[pkg] = currentKeybox
                     }
-                    // No suffix means AUTO mode.
                     else -> {
                         newModes[trimmedLine] = Mode.AUTO
                         newKeyboxes[trimmedLine] = currentKeybox
@@ -253,7 +258,16 @@ object ConfigurationManager {
             }
 
             // Parse global and per-package configurations.
-            val newGlobalLevel = parseLines(contextLines[""])
+            var newGlobalLevel = parseLines(contextLines[""])
+            // TrickyAddon writes Pixel bulletin dates for boot/vendor but system=prop
+            // resolves to the real device prop — force boot/vendor through the same path
+            // to prevent cross-component date mismatches on non-Pixel devices.
+            if (newGlobalLevel?.system.equals("prop", ignoreCase = true)) {
+                SystemLogger.info(
+                    "system=prop: forcing boot/vendor to derive from device props (were: boot=${newGlobalLevel?.boot}, vendor=${newGlobalLevel?.vendor})"
+                )
+                newGlobalLevel = newGlobalLevel?.copy(boot = "prop", vendor = "prop")
+            }
             contextLines.remove("") // Remove global context to iterate over packages next
 
             for ((pkg, lines) in contextLines) {
@@ -273,29 +287,6 @@ object ConfigurationManager {
         }
     }
 
-    /** Checks the device's TEE status and writes the result to a file for persistence. */
-    private fun storeTeeStatus() {
-        val statusFile = File(configRoot, TEE_STATUS_FILE)
-        isTeeBroken = !DeviceAttestationService.isTeeFunctional
-        try {
-            statusFile.writeText("tee_broken=$isTeeBroken")
-            SystemLogger.info("TEE status stored: isTeeBroken=$isTeeBroken")
-        } catch (e: Exception) {
-            SystemLogger.error("Failed to write TEE status to file.", e)
-        }
-    }
-
-    /** Loads the TEE status from the file. */
-    private fun loadTeeStatus() {
-        val statusFile = File(configRoot, TEE_STATUS_FILE)
-        isTeeBroken =
-            if (statusFile.exists()) {
-                statusFile.readText().trim() == "tee_broken=true"
-            } else {
-                null // Status is unknown.
-            }
-    }
-
     /**
      * A FileObserver that monitors the configuration directory for changes and triggers reloads of
      * the relevant settings.
@@ -307,8 +298,12 @@ object ConfigurationManager {
 
             val file = if (event != DELETE) File(configRoot, path) else null
             when (path) {
-                TARGET_PACKAGES_FILE -> loadTargetPackages(file!!)
-                PATCH_LEVEL_FILE -> loadPatchLevelConfig(file!!)
+                TARGET_PACKAGES_FILE ->
+                    file?.let { loadTargetPackages(it) }
+                        ?: SystemLogger.warning("$TARGET_PACKAGES_FILE was deleted.")
+                PATCH_LEVEL_FILE ->
+                    file?.let { loadPatchLevelConfig(it) }
+                        ?: SystemLogger.warning("$PATCH_LEVEL_FILE was deleted.")
                 // Any change to an XML file is assumed to be a keybox.
                 // The cache in KeyBoxManager will handle reloading it on its next use.
                 else ->
@@ -318,10 +313,15 @@ object ConfigurationManager {
                         )
                         KeyBoxManager.invalidateCache(path)
                         if (Build.VERSION.SDK_INT > Build.VERSION_CODES.R) {
-                            // Clear cached keys possibly containing old certificates
+                            // Drop only the patched cert chains so the next
+                            // attestation request re-signs with the new keybox.
+                            // Do NOT drop generatedKeys — that would destroy
+                            // every alias/private key in memory and on disk,
+                            // logging users out of any app that pinned a
+                            // persisted keystore alias.
                             org.matrix.TEESimulator.interception.keystore.shim
                                 .KeyMintSecurityLevelInterceptor
-                                .clearAllGeneratedKeys("updating $file")
+                                .invalidatePatchedChains("updating $file")
                         }
                     }
             }
@@ -351,7 +351,29 @@ object ConfigurationManager {
         return iPackageManager
     }
 
-    /** Retrieves the package names associated with a UID. */
+    fun checkSELinuxPermission(callingPid: Int, tclass: String, perm: String): Boolean {
+        return try {
+            val callerCtx =
+                java.io.File("/proc/$callingPid/attr/current").readText().trim('\u0000', ' ', '\n')
+            val selfCtx =
+                java.io.File("/proc/self/attr/current").readText().trim('\u0000', ' ', '\n')
+            android.os.SELinux.checkSELinuxAccess(callerCtx, selfCtx, tclass, perm)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun hasPermissionForUid(uid: Int, permission: String): Boolean {
+        val userId = uid / 100000
+        return getPackagesForUid(uid).any { pkg ->
+            try {
+                getPackageManager()?.checkPermission(permission, pkg, userId) == 0
+            } catch (_: Exception) {
+                false
+            }
+        }
+    }
+
     fun getPackagesForUid(uid: Int): Array<String> {
         return uidToPackagesCache.getOrPut(uid) {
             try {

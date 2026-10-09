@@ -1,10 +1,11 @@
 cmake_minimum_required(VERSION 3.10)
-project(Fateh7tee)
+project(fateh7)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -DNDEBUG")
 
 # LSPlt configuration
 OPTION(LSPLT_BUILD_SHARED OFF)
@@ -22,8 +23,10 @@ add_executable(libinject.so inject/main.cpp inject/utils.cpp)
 target_include_directories(libinject.so PUBLIC include)
 target_link_libraries(libinject.so PRIVATE lsplt_static)
 
+add_executable(libsupervisor.so supervisor.cpp)
+target_link_libraries(libsupervisor.so PRIVATE log)
+
 add_library(${CMAKE_PROJECT_NAME} SHARED binder_interceptor.cpp)
-set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME "integrityfateh7")
 target_include_directories(${CMAKE_PROJECT_NAME} PUBLIC external/linux-kernel/include include)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE binder lsplt_static utils)
 

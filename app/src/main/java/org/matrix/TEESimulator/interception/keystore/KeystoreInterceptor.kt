@@ -79,7 +79,7 @@ object KeystoreInterceptor : AbstractKeystoreInterceptor() {
 
     override val serviceName = "android.security.keystore"
     override val processName = "keystore"
-    override val injectionCommand = "exec ./inject `pidof keystore` libintegrityfateh7.so entry"
+    override val injectionCommand = "exec ./inject `pidof keystore` libfateh7.so entry"
 
     // State management for the multi-step key generation process.
     private val keygenParameters = ConcurrentHashMap<KeyIdentifier, LegacyKeygenParameters>()
@@ -399,17 +399,17 @@ private data class LegacyKeygenParameters(
 
     /**
      * Converts the legacy parameters into the modern [KeyMintAttestation] data structure, which is
-     * required by [AttestationBuilder] and [CertificateGenerator].
+     * required by the refactored [AttestationBuilder] and [CertificateGenerator].
      */
     fun toKeyMintAttestation(): KeyMintAttestation {
         // This conversion acts as a bridge, allowing our new generic components
         // to be used by the legacy interceptor.
         return KeyMintAttestation(
-            algorithm = this.algorithm,
-            ecCurve = 0, // Not explicitly available in legacy args, but not critical
-            ecCurveName = this.ecCurveName ?: "",
             keySize = this.keySize,
-            origin = null, // Not needed to build attestaion
+            algorithm = this.algorithm,
+            ecCurve = 0,
+            ecCurveName = this.ecCurveName ?: "",
+            origin = null,
             blockMode = listOf<Int>(),
             padding = listOf<Int>(),
             purpose = this.purpose,
@@ -431,6 +431,24 @@ private data class LegacyKeygenParameters(
             manufacturer = null,
             model = null,
             secondImei = null,
+            activeDateTime = null,
+            originationExpireDateTime = null,
+            usageExpireDateTime = null,
+            usageCountLimit = null,
+            callerNonce = null,
+            nonce = null,
+            unlockedDeviceRequired = null,
+            includeUniqueId = null,
+            rollbackResistance = null,
+            earlyBootOnly = null,
+            allowWhileOnBody = null,
+            trustedUserPresenceRequired = null,
+            trustedConfirmationRequired = null,
+            noAuthRequired = null,
+            maxUsesPerBoot = null,
+            maxBootLevel = null,
+            minMacLength = null,
+            rsaOaepMgfDigest = emptyList(),
         )
     }
 

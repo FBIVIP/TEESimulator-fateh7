@@ -37,22 +37,6 @@ object KeyMintParameterLogger {
             .associate { field -> (field.get(null) as Int) to field.name }
     }
 
-    val hardwareAuthenticatorTypeNames: Map<Int, String> by lazy {
-        HardwareAuthenticatorType::class
-            .java
-            .fields
-            .filter { it.type == Int::class.java }
-            .associate { field -> (field.get(null) as Int) to field.name }
-    }
-
-    val keyOriginNames: Map<Int, String> by lazy {
-        KeyOrigin::class
-            .java
-            .fields
-            .filter { it.type == Int::class.java }
-            .associate { field -> (field.get(null) as Int) to field.name }
-    }
-
     val paddingNames: Map<Int, String> by lazy {
         PaddingMode::class
             .java
@@ -85,43 +69,43 @@ object KeyMintParameterLogger {
             .associate { field -> (field.get(null) as Int) to field.name }
     }
 
-    /**
-     * Logs a single KeyParameter in a formatted, readable way.
-     *
-     * @param param The KeyParameter to log.
-     */
+    /** Logs a single KeyParameter to the shared debug stream (used for un-scoped param dumps). */
     fun logParameter(param: KeyParameter) {
+        SystemLogger.debug("KeyParam: ${describe(param)}")
+    }
+
+    /** Logs a single KeyParameter onto a targeted UID's diagnostic plane as a `param` record. */
+    fun logParameter(uid: Int, txId: Long, param: KeyParameter) {
+        SystemLogger.uidLog(uid, txId, "param", describe(param))
+    }
+
+    /**
+     * Formats a single KeyParameter into a readable `tag | Value` string. Shared by both
+     * [logParameter] overloads so the two logging planes render parameters identically.
+     *
+     * @param param The KeyParameter to format.
+     */
+    private fun describe(param: KeyParameter): String {
         val tagName = tagNames[param.tag] ?: "UNKNOWN_TAG"
         val value = param.value
         val formattedValue: String =
             when (param.tag) {
                 Tag.ALGORITHM -> algorithmNames[value.algorithm]
                 Tag.BLOCK_MODE -> blockModeNames[value.blockMode]
-                Tag.DIGEST -> digestNames[value.digest]
                 Tag.EC_CURVE -> ecCurveNames[value.ecCurve]
-                Tag.ORIGIN -> keyOriginNames[value.origin]
                 Tag.PADDING -> paddingNames[value.paddingMode]
                 Tag.PURPOSE -> purposeNames[value.keyPurpose]
-                Tag.USER_AUTH_TYPE ->
-                    hardwareAuthenticatorTypeNames[value.hardwareAuthenticatorType]
+                Tag.DIGEST -> digestNames[value.digest]
                 Tag.AUTH_TIMEOUT,
-                Tag.BOOT_PATCHLEVEL,
                 Tag.KEY_SIZE,
-                Tag.MAC_LENGTH,
-                Tag.MIN_MAC_LENGTH,
-                Tag.OS_VERSION,
-                Tag.OS_PATCHLEVEL,
-                Tag.USER_ID,
-                Tag.VENDOR_PATCHLEVEL -> value.integer.toString()
+                Tag.MIN_MAC_LENGTH -> value.integer.toString()
                 Tag.CERTIFICATE_SERIAL -> BigInteger(value.blob).toString()
                 Tag.ACTIVE_DATETIME,
                 Tag.CERTIFICATE_NOT_AFTER,
                 Tag.CERTIFICATE_NOT_BEFORE,
-                Tag.CREATION_DATETIME,
                 Tag.ORIGINATION_EXPIRE_DATETIME,
                 Tag.USAGE_EXPIRE_DATETIME -> Date(value.dateTime).toString()
                 Tag.CERTIFICATE_SUBJECT -> X500Name(X500Principal(value.blob).name).toString()
-                Tag.USER_SECURE_ID,
                 Tag.RSA_PUBLIC_EXPONENT -> value.longInteger.toString()
                 Tag.NO_AUTH_REQUIRED -> "true"
                 Tag.ATTESTATION_CHALLENGE,
@@ -137,7 +121,7 @@ object KeyMintParameterLogger {
                 else -> "<raw>"
             } ?: "Unknown Value"
 
-        SystemLogger.debug("KeyParam: %-25s | Value: %s".format(tagName, formattedValue))
+        return "%-25s | Value: %s".format(tagName, formattedValue)
     }
 
     private fun ByteArray.toReadableString(): String {

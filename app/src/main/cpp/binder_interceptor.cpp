@@ -235,19 +235,21 @@ class BinderInterceptor : public BBinder {
     struct RegistrationEntry {
         wp<IBinder> target;
         sp<IBinder> callback_interface;
+        std::vector<uint32_t> filtered_codes;
     };
 
-    // Reader-Writer lock for the registry to allow concurrent reads (lookups)
     mutable std::shared_mutex registry_mutex_;
     std::map<wp<IBinder>, RegistrationEntry> registry_;
 
 public:
     BinderInterceptor() = default;
 
-    // Checks if a specific Binder instance is currently registered for interception
-    bool isBinderIntercepted(const wp<BBinder> &target) const {
+    bool shouldIntercept(const wp<BBinder> &target, uint32_t code) const {
         std::shared_lock lock(registry_mutex_);
-        return registry_.find(target) != registry_.end();
+        auto it = registry_.find(target);
+        if (it == registry_.end()) return false;
+        const auto &codes = it->second.filtered_codes;
+        return codes.empty() || std::find(codes.begin(), codes.end(), code) != codes.end();
     }
 
     // Main entry point for processing the "Man-in-the-Middle" logic
@@ -348,13 +350,14 @@ static sp<BinderStub> g_stub_instance = nullptr;
 
 namespace {
 
-/**
- * @brief Analyses a binder transaction. If the target is monitored,
- *        hijacks the transaction by rewriting its destination to our BinderStub.
- * @param txn_data Pointer to the transaction data within the ioctl buffer.
- */
 void inspectAndRewriteTransaction(binder_transaction_data *txn_data) {
     if (!txn_data || txn_data->target.ptr == 0)
+        return;
+
+    // AIDL methods use codes in [FIRST_CALL_TRANSACTION, LAST_CALL_TRANSACTION] (1..0x00ffffff).
+    // System transactions (PING, INTERFACE, DUMP, SHELL_COMMAND) use codes above that range.
+    // Skip those — intercepting a ping adds measurable latency that timing detectors flag.
+    if (txn_data->code > 0x00ffffffu && txn_data->code != intercept::kBackdoorCode)
         return;
 
     bool hijack = false;
@@ -386,7 +389,7 @@ void inspectAndRewriteTransaction(binder_transaction_data *txn_data) {
             // This is safe because we are holding a strong reference.
             wp<BBinder> wp_target = target_binder_ptr;
 
-            if (g_interceptor_instance->isBinderIntercepted(wp_target)) {
+            if (g_interceptor_instance->shouldIntercept(wp_target, txn_data->code)) {
                 info.transaction_code = txn_data->code;
                 info.target_binder = wp_target; // Assign the valid weak pointer
                 hijack = true;
@@ -400,7 +403,10 @@ void inspectAndRewriteTransaction(binder_transaction_data *txn_data) {
         uint64_t tx_id = ++g_transaction_id_counter;
         info.transaction_id = tx_id;
 
-        LOGV("[Hook] Hijacking Transaction %" PRIu64 " (Code: %u)", tx_id, txn_data->code);
+        // tx_id is the same counter handed to the Kotlin interceptor, and sender_euid is the
+        // calling app; together they correlate this native hijack with that UID's per-UID file.
+        LOGV("[Hook] Hijacking Transaction %" PRIu64 " (Code: %u, uid=%u)", tx_id, txn_data->code,
+             txn_data->sender_euid);
 
         // Rewrite the destination to our Stub
         txn_data->target.ptr = reinterpret_cast<uintptr_t>(g_stub_instance->getWeakRefs());
@@ -425,44 +431,29 @@ void processBinderReadBuffer(const binder_write_read &bwr) {
     uintptr_t ptr = bwr.read_buffer;
     uintptr_t end = ptr + bwr.read_consumed;
 
-    LOGV("[Hook] Processing Read Buffer: Size=%llu, Consumed=%llu", bwr.read_size, bwr.read_consumed);
-
     while (ptr < end) {
-        // Ensure we can read at least the command header
         if (end - ptr < sizeof(uint32_t))
             break;
 
         uint32_t cmd = *reinterpret_cast<const uint32_t *>(ptr);
         ptr += sizeof(uint32_t);
-
-        // Calculate payload size from the ioctl command code
         size_t cmd_size = _IOC_SIZE(cmd);
 
-        // Log the command using our generated to-string function
-        LOGV("[Driver -> User] Command: %s (0x%x), DataSize: %zu", getBinderReturnCommandName(cmd), cmd, cmd_size);
-
-        // Safety check: ensure the command's data does not exceed the buffer
         if (ptr + cmd_size > end) {
-            LOGE("[Hook] Buffer overflow detected while parsing command %s", getBinderReturnCommandName(cmd));
+            LOGE("[Hook] Buffer overrun parsing command 0x%x", cmd);
             break;
         }
 
-        // We are primarily interested in BR_TRANSACTION commands to intercept
-        if (cmd == BR_TRANSACTION || cmd == BR_TRANSACTION_SEC_CTX) {
-            binder_transaction_data *txn = nullptr;
-
+        if (__builtin_expect(cmd == BR_TRANSACTION || cmd == BR_TRANSACTION_SEC_CTX, 0)) {
+            binder_transaction_data *txn;
             if (cmd == BR_TRANSACTION_SEC_CTX) {
-                // The data is wrapped in a secctx struct
-                auto *wrapper = reinterpret_cast<binder_transaction_data_secctx *>(ptr);
-                txn = &wrapper->transaction_data;
+                txn = &reinterpret_cast<binder_transaction_data_secctx *>(ptr)->transaction_data;
             } else {
                 txn = reinterpret_cast<binder_transaction_data *>(ptr);
             }
-
             inspectAndRewriteTransaction(txn);
         }
 
-        // Advance pointer to the next command
         ptr += cmd_size;
     }
 }
@@ -482,13 +473,17 @@ int intercepted_ioctl(int fd, int request, ...) {
     // 1. Call original kernel ioctl to let the driver do its work
     int result = g_original_ioctl(fd, request, arg);
 
-    // 2. After the call returns, check if it was a BINDER_WRITE_READ and if it succeeded
     if (result >= 0 && request == BINDER_WRITE_READ && arg != nullptr) {
         const auto *bwr = static_cast<const binder_write_read *>(arg);
-
-        // We only care about data read FROM the driver (i.e., incoming commands)
-        if (bwr->read_consumed > 0) {
-            processBinderReadBuffer(*bwr);
+        // Fast reject: only enter the parser if the buffer could contain a BR_TRANSACTION.
+        // Pings, ref ops, and looper management never produce BR_TRANSACTION, so scanning
+        // their buffers is pure overhead (~2-5us per ioctl in debug builds).
+        if (bwr->read_consumed >= sizeof(uint32_t)) {
+            uint32_t first_cmd = *reinterpret_cast<const uint32_t *>(bwr->read_buffer);
+            if (first_cmd == BR_TRANSACTION || first_cmd == BR_TRANSACTION_SEC_CTX
+                || bwr->read_consumed > sizeof(uint32_t) + _IOC_SIZE(first_cmd)) {
+                processBinderReadBuffer(*bwr);
+            }
         }
     }
 
@@ -531,18 +526,29 @@ status_t BinderInterceptor::handleRegister(const Parcel &data) {
     if (data.readStrongBinder(&callback) != OK || !callback)
         return BAD_VALUE;
 
-    // We can only intercept local Binders (BBinder), not remote proxies (BpBinder)
     if (target->localBinder() == nullptr) {
         LOGE("Cannot intercept remote binder proxies.");
         return BAD_TYPE;
     }
 
+    std::vector<uint32_t> codes;
+    int32_t code_count = 0;
+    if (data.dataAvail() >= sizeof(int32_t) && data.readInt32(&code_count) == OK && code_count > 0) {
+        codes.reserve(code_count);
+        for (int32_t i = 0; i < code_count; i++) {
+            uint32_t c = 0;
+            if (data.readUint32(&c) == OK) codes.push_back(c);
+        }
+        LOGI("Interceptor registered for binder %p with %zu filtered codes", target.get(), codes.size());
+    } else {
+        LOGI("Interceptor registered for binder %p (all codes)", target.get());
+    }
+
     wp<IBinder> weak_target = target;
 
     std::unique_lock lock(registry_mutex_);
-    registry_[weak_target] = {weak_target, callback};
+    registry_[weak_target] = {weak_target, callback, std::move(codes)};
 
-    LOGI("Interceptor registered for binder %p", target.get());
     return OK;
 }
 
@@ -592,9 +598,16 @@ bool BinderInterceptor::processInterceptedTransaction(uint64_t tx_id, sp<BBinder
     Parcel pre_req, pre_resp;
     writeTransactionData(pre_req, tx_id, target, code, flags, request);
 
-    if (callback->transact(intercept::kPreTransact, pre_req, &pre_resp) != OK) {
-        LOGW("[TX_ID: %" PRIu64 "] Pre-transaction callback failed. Forwarding original call.", tx_id);
-        return false; // Callback failed, proceed as if not intercepted
+    status_t pre_status = callback->transact(intercept::kPreTransact, pre_req, &pre_resp);
+    if (pre_status != OK) {
+        // Block when interceptor is dead to prevent privacy leak to third-party apps
+        if (callback->pingBinder() != OK) {
+            LOGE("[TX_ID: %" PRIu64 "] Interceptor DEAD. Blocking to prevent attestation leak.", tx_id);
+            result = DEAD_OBJECT;
+            return true;
+        }
+        LOGW("[TX_ID: %" PRIu64 "] Pre-transaction callback failed (not dead). Forwarding.", tx_id);
+        return false;
     }
 
     int32_t action = pre_resp.readInt32();
@@ -647,7 +660,8 @@ bool BinderInterceptor::processInterceptedTransaction(uint64_t tx_id, sp<BBinder
         VALIDATE_STATUS(tx_id, post_req.appendFrom(reply, 0, reply_size));
     }
 
-    if (callback->transact(intercept::kPostTransact, post_req, &post_resp) == OK) {
+    status_t post_status = callback->transact(intercept::kPostTransact, post_req, &post_resp);
+    if (post_status == OK) {
         int32_t post_action = post_resp.readInt32();
         if (post_action == intercept::kActionOverrideReply && reply) {
             result = post_resp.readInt32(); // Read new status

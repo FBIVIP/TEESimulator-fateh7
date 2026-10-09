@@ -1,6 +1,5 @@
 package org.matrix.TEESimulator.util
 
-import android.hardware.security.keymint.SecurityLevel
 import android.os.Build
 import android.os.SystemProperties
 import java.io.ByteArrayOutputStream
@@ -9,13 +8,16 @@ import java.io.FileInputStream
 import java.security.MessageDigest
 import java.time.LocalDate
 import java.util.concurrent.ThreadLocalRandom
+import javax.xml.parsers.DocumentBuilderFactory
 import org.bouncycastle.asn1.ASN1EncodableVector
 import org.bouncycastle.asn1.ASN1Integer
 import org.bouncycastle.asn1.DEROctetString
 import org.bouncycastle.asn1.DERSequence
 import org.matrix.TEESimulator.attestation.DeviceAttestationService
+import org.matrix.TEESimulator.config.BootStateManager
 import org.matrix.TEESimulator.config.ConfigurationManager
 import org.matrix.TEESimulator.logging.SystemLogger
+import org.w3c.dom.Element
 
 /**
  * Provides utility functions for accessing Android system properties and device-specific
@@ -44,6 +46,7 @@ object AndroidDeviceUtils {
                 DeviceAttestationService.CachedAttestationData?.verifiedBootKey
             },
             expectedSize = 32,
+            recordSource = { bootKeySource = it },
         )
     }
 
@@ -61,8 +64,15 @@ object AndroidDeviceUtils {
                 DeviceAttestationService.CachedAttestationData?.verifiedBootHash
             },
             expectedSize = 32,
+            recordSource = { bootHashSource = it },
         )
     }
+
+    // Records which fallback tier supplied bootKey/bootHash so the diagnostic dossier can flag a
+    // random-fallback value — a real verifiedBootKey that resolves to random bytes is a textbook
+    // simulated-TEE tell. Populated by initializeBootProperty on first access.
+    @Volatile private var bootKeySource: String = "uninitialized"
+    @Volatile private var bootHashSource: String = "uninitialized"
 
     /**
      * Public function to explicitly trigger the initialization of the boot key and hash. Accessing
@@ -90,28 +100,39 @@ object AndroidDeviceUtils {
         propertyName: String,
         attestationValueProvider: () -> ByteArray?,
         expectedSize: Int,
+        recordSource: (String) -> Unit,
     ): ByteArray {
-        // 1. Attempt to get the value from the system property.
         getProperty(propertyName, expectedSize)?.let {
             SystemLogger.debug("Using $propertyName from system property: ${it.toHex()}")
+            recordSource("system-prop")
+            persistToFile(propertyName, it)
             return it
         }
 
-        // 2. Fallback to the value from a cached TEE attestation.
         try {
             attestationValueProvider()?.let {
                 SystemLogger.debug("Using $propertyName from TEE attestation: ${it.toHex()}")
-                setProperty(propertyName, it) // Persist for consistency
+                recordSource("tee-attestation")
+                setBootProperty(propertyName, it)
+                persistToFile(propertyName, it)
                 return it
             }
         } catch (e: Exception) {
             SystemLogger.error("Failed to get $propertyName from attestation.", e)
         }
 
-        // 3. As a final fallback, generate a random value.
+        readFromFile(propertyName, expectedSize)?.let {
+            SystemLogger.debug("Using $propertyName from persistent file: ${it.toHex()}")
+            recordSource("persistent-file")
+            setBootProperty(propertyName, it)
+            return it
+        }
+
         return generateRandomBytes(expectedSize).also {
             SystemLogger.debug("Using randomly generated $propertyName: ${it.toHex()}")
-            setProperty(propertyName, it)
+            recordSource("random-fallback")
+            setBootProperty(propertyName, it)
+            persistToFile(propertyName, it)
         }
     }
 
@@ -158,9 +179,63 @@ object AndroidDeviceUtils {
         }
     }
 
-    /** Generates a cryptographically random byte array of a specified length. */
+    private fun setBootProperty(name: String, bytes: ByteArray) {
+        if (!BootStateManager.shouldSpoofBootProps()) {
+            SystemLogger.info("Skipping system property '$name' because boot prop spoofing is disabled")
+            return
+        }
+        setProperty(name, bytes)
+    }
+
+    internal fun setProperty(name: String, value: String) {
+        try {
+            SystemLogger.debug("Setting system property '$name' to: $value")
+            val command = arrayOf("resetprop", name, value)
+            val process = Runtime.getRuntime().exec(command)
+            val exitCode = process.waitFor()
+
+            if (exitCode != 0) {
+                val errorOutput = process.errorStream.bufferedReader().readText()
+                SystemLogger.error(
+                    "resetprop for '$name' failed with exit code $exitCode: $errorOutput"
+                )
+            }
+        } catch (e: Exception) {
+            SystemLogger.error("Failed to set '$name' property via resetprop.", e)
+        }
+    }
+
     private fun generateRandomBytes(size: Int): ByteArray =
         ByteArray(size).also { ThreadLocalRandom.current().nextBytes(it) }
+
+    private val PERSIST_DIR = File("/data/misc/the_next_xx")
+
+    private fun fileForProperty(propertyName: String): File =
+        when (propertyName) {
+            "ro.boot.vbmeta.digest" -> File(PERSIST_DIR, "boot_hash.bin")
+            "ro.boot.vbmeta.public_key_digest" -> File(PERSIST_DIR, "boot_key.bin")
+            else -> File(PERSIST_DIR, "${propertyName.replace('.', '_')}.bin")
+        }
+
+    private fun persistToFile(propertyName: String, bytes: ByteArray) {
+        try {
+            fileForProperty(propertyName).writeBytes(bytes)
+        } catch (e: Exception) {
+            SystemLogger.error("Failed to persist $propertyName to file.", e)
+        }
+    }
+
+    private fun readFromFile(propertyName: String, expectedSize: Int): ByteArray? {
+        return try {
+            val file = fileForProperty(propertyName)
+            if (!file.exists()) return null
+            val bytes = file.readBytes()
+            if (bytes.size == expectedSize) bytes else null
+        } catch (e: Exception) {
+            SystemLogger.error("Failed to read $propertyName from file.", e)
+            null
+        }
+    }
 
     // --- Patch Level Properties ---
 
@@ -177,6 +252,23 @@ object AndroidDeviceUtils {
     fun getBootPatchLevelLong(uid: Int): Int {
         val custom = getCustomPatchLevelFor(uid, "boot", isLong = true)
         return custom ?: getRealDevicePatchLevelInt("boot", isLong = true)
+    }
+
+    /**
+     * Summarises, for a targeted [uid], the device values that feed attestation and where each came
+     * from. This is what exposes attested-versus-live mismatches: a random-fallback verifiedBootKey,
+     * a patch level overridden away from the live prop, or an OS version pulled from a stale cache.
+     */
+    fun describeSources(uid: Int): String {
+        val customPatchLevel = ConfigurationManager.getPatchLevelForUid(uid) != null
+        val osVersionSource =
+            if (DeviceAttestationService.CachedAttestationData?.osVersion != null) "cache" else "map"
+        return "osVersion=$osVersion(src=$osVersionSource) " +
+            "osPatch=${getPatchLevel(uid)} vendorPatch=${getVendorPatchLevelLong(uid)} " +
+            "bootPatch=${getBootPatchLevelLong(uid)} customPatchLevel=$customPatchLevel " +
+            "bootKey=${bootKey.toHex()}(src=$bootKeySource) " +
+            "bootHash=${bootHash.toHex()}(src=$bootHashSource) " +
+            "teeCacheData=${DeviceAttestationService.CachedAttestationData != null}"
     }
 
     /**
@@ -240,11 +332,15 @@ object AndroidDeviceUtils {
         val resolvedValue = resolveDateKeywords(value)
 
         return when {
-            // "device_default" indicates falling back to the system property.
             resolvedValue.equals("device_default", ignoreCase = true) -> null
-            // "no" indicates this value should not be reported.
+            // Resolve from live system prop — matches what detectors see via getprop,
+            // even when PIF has spoofed ro.build.version.security_patch via resetprop
+            resolvedValue.equals("prop", ignoreCase = true) ->
+                parsePatchLevelValue(
+                    SystemProperties.get("ro.build.version.security_patch", ""),
+                    isLong,
+                )
             resolvedValue.equals("no", ignoreCase = true) -> DO_NOT_REPORT
-            // Otherwise, parse the resolved date string.
             else -> parsePatchLevelValue(resolvedValue, isLong)
         }
     }
@@ -294,7 +390,9 @@ object AndroidDeviceUtils {
                 6 -> { // YYYYMM
                     val year = normalized.substring(0, 4).toInt()
                     val month = normalized.substring(4, 6).toInt()
-                    if (isLong) year * 10000 + month * 100 + 1 else year * 100 + month
+                    // Synthesizing day=01 from YYYY-MM disagrees with real device bulletins;
+                    // propagate null so callers fall back to a YYYY-MM-DD source.
+                    if (isLong) null else year * 100 + month
                 }
                 else -> null
             }
@@ -341,40 +439,257 @@ object AndroidDeviceUtils {
             Build.VERSION_CODES.BAKLAVA to 400, // KeyMint 4.0
         )
 
+    /** AOSP-mandated attestation version for the running OS, or null when the SDK is unmapped. */
+    internal val aospAttestVersion: Int?
+        get() = attestVersionMap[Build.VERSION.SDK_INT]
+
     /**
-     * Retrieves the attestation version based on security level and OS version. StrongBox (level 2)
-     * requires version 300.
+     * Retrieves the attestation version for the given security level. A readable KeyMint VINTF
+     * declaration wins first, so local probes that compare the attested version against the
+     * device's manifest see a coherent pair. Otherwise the legacy chain applies: cached attestation
+     * data, then attestVersionMap[SDK_INT], then 400 as last resort.
      *
      * @param securityLevel The security level of the attestation (1 for TEE, 2 for StrongBox).
      * @return The appropriate attestation version number.
      */
     fun getAttestVersion(securityLevel: Int): Int {
-        // StrongBox security level requires an attestation version of at least 300.
-        if (securityLevel == SecurityLevel.STRONGBOX) {
-            return 300
+        vintfKeyMintVersion?.let { version ->
+            SystemLogger.debug(
+                "attestVersion=${version.attestationVersion} source=vintf securityLevel=$securityLevel"
+            )
+            return version.attestationVersion
         }
-        return DeviceAttestationService.CachedAttestationData?.attestVersion
-            ?: attestVersionMap[Build.VERSION.SDK_INT]
-            ?: 400 // Default to a recent version
+
+        val cached = DeviceAttestationService.CachedAttestationData?.attestVersion
+        val version =
+            cached ?: attestVersionMap[Build.VERSION.SDK_INT] ?: 400 // Default to a recent version
+        val source =
+            when {
+                cached != null -> "cache"
+                attestVersionMap.containsKey(Build.VERSION.SDK_INT) -> "map"
+                else -> "default"
+            }
+        SystemLogger.debug("attestVersion=$version source=$source securityLevel=$securityLevel")
+        SystemLogger.debug(
+            "vintf-version attest=$version keymaster=$version source=$source securityLevel=$securityLevel"
+        )
+        return version
     }
 
     /**
-     * Retrieves the Keymaster/KeyMint version based on the attestation version.
+     * Retrieves the Keymaster/KeyMint version. A readable KeyMint VINTF declaration is
+     * authoritative because recent local detectors compare the attested version directly against
+     * the manifest declaration.
      *
      * @param securityLevel The security level, used to determine the correct attestation version.
      * @return The appropriate Keymaster or KeyMint version number.
      */
     fun getKeymasterVersion(securityLevel: Int): Int {
-        val attestVersion = getAttestVersion(securityLevel)
-        return if (attestVersion >= 100) attestVersion else 41 // Keymaster 4.1 for older versions
+        vintfKeyMintVersion?.let { version ->
+            SystemLogger.debug(
+                "keymasterVersion=${version.keymasterVersion} source=vintf securityLevel=$securityLevel"
+            )
+            return version.keymasterVersion
+        }
+        return getAttestVersion(securityLevel)
     }
+
+    /**
+     * KeyMint/Keymaster version pair resolved from a device VINTF manifest. [attestationVersion] is
+     * the value written into the attestation record; [keymasterVersion] is the HAL version field.
+     * They coincide for AIDL KeyMint and diverge only for legacy HIDL Keymaster.
+     */
+    private data class VintfKeyMintVersion(
+        val attestationVersion: Int,
+        val keymasterVersion: Int,
+        val sourcePath: String,
+    )
+
+    /**
+     * KeyMint version derived from the device's VINTF manifests, or null when none is readable.
+     * Resolved lazily so the manifest scan happens once, off the attestation hot path.
+     */
+    private val vintfKeyMintVersion: VintfKeyMintVersion? by lazy {
+        readVintfKeyMintVersion().also { version ->
+            if (version != null) {
+                SystemLogger.info(
+                    "Using KeyMint version from VINTF: attestation=${version.attestationVersion}, " +
+                        "keymaster=${version.keymasterVersion}, source=${version.sourcePath}"
+                )
+            } else {
+                SystemLogger.debug(
+                    "No usable KeyMint VINTF declaration found; using attestation fallback"
+                )
+            }
+        }
+    }
+
+    private fun readVintfKeyMintVersion(): VintfKeyMintVersion? {
+        val files = linkedMapOf<String, File>()
+
+        VINTF_MANIFEST_DIRS.forEach { path ->
+            val dir = File(path)
+            if (!dir.exists() || !dir.isDirectory) return@forEach
+            val listed =
+                runCatching {
+                        dir.listFiles { file ->
+                            file.isFile && file.name.endsWith(".xml", ignoreCase = true)
+                        }
+                    }
+                    .getOrElse { throwable ->
+                        SystemLogger.debug("Unable to list VINTF dir $path: ${throwable.message}")
+                        null
+                    }
+            listed?.forEach { file -> files[file.absolutePath] = file }
+        }
+
+        VINTF_MANIFEST_FILES.forEach { path ->
+            val file = File(path)
+            if (file.exists() && file.isFile) {
+                files[file.absolutePath] = file
+            }
+        }
+
+        return files.values
+            .flatMap { file ->
+                runCatching { parseKeyMintVersions(file) }
+                    .getOrElse { throwable ->
+                        SystemLogger.debug(
+                            "Unable to parse KeyMint VINTF ${file.absolutePath}: ${throwable.message}"
+                        )
+                        emptyList()
+                    }
+            }
+            .maxByOrNull { it.attestationVersion }
+    }
+
+    private fun parseKeyMintVersions(file: File): List<VintfKeyMintVersion> {
+        val document = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(file)
+        val root = document.documentElement ?: return emptyList()
+
+        return directChildElements(root, "hal").flatMap { hal ->
+            val halName = directChildTexts(hal, "name").firstOrNull().orEmpty()
+            val versions = directChildTexts(hal, "version")
+            val fqnames = directChildTexts(hal, "fqname")
+            val interfaces =
+                directChildElements(hal, "interface").associate { interfaceElement ->
+                    val name = directChildTexts(interfaceElement, "name").firstOrNull().orEmpty()
+                    val instances = directChildTexts(interfaceElement, "instance").toSet()
+                    name to instances
+                }
+
+            when (halName) {
+                KEYMINT_HAL_NAME ->
+                    if (hasDefaultInstance(fqnames, interfaces, KEYMINT_INTERFACE_NAME)) {
+                        versions.mapNotNull { version ->
+                            version
+                                .toIntOrNull()
+                                ?.takeIf { it > 0 }
+                                ?.let { aidlVersion ->
+                                    val attestationVersion = aidlVersion * 100
+                                    VintfKeyMintVersion(
+                                        attestationVersion = attestationVersion,
+                                        keymasterVersion = attestationVersion,
+                                        sourcePath = file.absolutePath,
+                                    )
+                                }
+                        }
+                    } else {
+                        emptyList()
+                    }
+                KEYMASTER_HAL_NAME ->
+                    if (hasDefaultInstance(fqnames, interfaces, KEYMASTER_INTERFACE_NAME)) {
+                        (versions.flatMap(::expandHidlVersions) +
+                                fqnames.mapNotNull(::versionFromFqname))
+                            .distinct()
+                            .mapNotNull { version ->
+                                expectedLegacyVersions(version)?.let { expected ->
+                                    VintfKeyMintVersion(
+                                        attestationVersion = expected.second,
+                                        keymasterVersion = expected.first,
+                                        sourcePath = file.absolutePath,
+                                    )
+                                }
+                            }
+                    } else {
+                        emptyList()
+                    }
+                else -> emptyList()
+            }
+        }
+    }
+
+    private fun directChildElements(parent: Element, tagName: String): List<Element> = buildList {
+        val children = parent.childNodes
+        for (index in 0 until children.length) {
+            val child = children.item(index)
+            if (child is Element && child.tagName == tagName) {
+                add(child)
+            }
+        }
+    }
+
+    private fun directChildTexts(parent: Element, tagName: String): List<String> =
+        directChildElements(parent, tagName)
+            .map { it.textContent.trim() }
+            .filter { it.isNotEmpty() }
+
+    private fun hasDefaultInstance(
+        fqnames: List<String>,
+        interfaces: Map<String, Set<String>>,
+        interfaceName: String,
+    ): Boolean =
+        fqnames.any { fqname ->
+            fqname.substringAfter("::", fqname).substringBefore("/") == interfaceName &&
+                fqname.substringAfter("/", "") == DEFAULT_INSTANCE
+        } || interfaces[interfaceName]?.contains(DEFAULT_INSTANCE) == true
+
+    private fun versionFromFqname(fqname: String): String? =
+        FQNAME_VERSION_REGEX.find(fqname)?.groupValues?.getOrNull(1)
+
+    private fun expectedLegacyVersions(version: String): Pair<Int, Int>? =
+        when (version) {
+            "3.0" -> 3 to 2
+            "4.0" -> 4 to 3
+            "4.1" -> 41 to 4
+            else -> null
+        }
+
+    private fun expandHidlVersions(version: String): List<String> {
+        val range = HIDL_VERSION_RANGE_REGEX.matchEntire(version) ?: return listOf(version)
+        val major = range.groupValues[1]
+        val firstMinor = range.groupValues[2].toInt()
+        val lastMinor = range.groupValues[3].toInt()
+        return (firstMinor..lastMinor).map { minor -> "$major.$minor" }
+    }
+
+    private val VINTF_MANIFEST_DIRS =
+        listOf(
+            "/system/etc/vintf/manifest",
+            "/system_ext/etc/vintf/manifest",
+            "/product/etc/vintf/manifest",
+            "/vendor/etc/vintf/manifest",
+            "/odm/etc/vintf/manifest",
+        )
+    private val VINTF_MANIFEST_FILES =
+        listOf(
+            "/system/etc/vintf/manifest.xml",
+            "/system_ext/etc/vintf/manifest.xml",
+            "/product/etc/vintf/manifest.xml",
+            "/vendor/etc/vintf/manifest.xml",
+            "/odm/etc/vintf/manifest.xml",
+        )
+    private const val KEYMINT_HAL_NAME = "android.hardware.security.keymint"
+    private const val KEYMASTER_HAL_NAME = "android.hardware.keymaster"
+    private const val KEYMINT_INTERFACE_NAME = "IKeyMintDevice"
+    private const val KEYMASTER_INTERFACE_NAME = "IKeymasterDevice"
+    private const val DEFAULT_INSTANCE = "default"
+    private val FQNAME_VERSION_REGEX = Regex("^@([0-9]+(?:\\.[0-9]+)?)::")
+    private val HIDL_VERSION_RANGE_REGEX = Regex("^([0-9]+)\\.([0-9]+)-([0-9]+)$")
 
     // --- APEX and Module Hash Properties ---
 
-    // https://cs.android.com/android/platform/superproject/+/android-latest-release:system/apex/proto/apex_manifest.proto
-    // --- Minimal Protobuf Parser for ApexManifest ---
-    // Field 1: name (string)
-    // Field 2: version (int64)
+    // Minimal protobuf parser for apex_manifest.pb (field 1: name, field 2: version)
     private class MinimalApexManifestParser(private val data: ByteArray) {
         var pos = 0
 
@@ -388,13 +703,13 @@ object AndroidDeviceUtils {
                 val wireType = (tag and 0x07).toInt()
 
                 when (fieldNum) {
-                    1L -> { // name
+                    1L -> {
                         val length = readVarint().toInt()
                         if (pos + length > data.size) return null
                         name = String(data, pos, length, Charsets.UTF_8)
                         pos += length
                     }
-                    2L -> { // version
+                    2L -> {
                         version = readVarint()
                     }
                     else -> skipField(wireType)
@@ -422,19 +737,18 @@ object AndroidDeviceUtils {
 
         private fun skipField(wireType: Int) {
             when (wireType) {
-                0 -> readVarint() // Varint
-                1 -> pos += 8 // 64-bit
-                2 -> { // Length-delimited
+                0 -> readVarint()
+                1 -> pos += 8
+                2 -> {
                     val len = readVarint().toInt()
                     pos += len
                 }
-                5 -> pos += 4 // 32-bit
+                5 -> pos += 4
                 else -> throw IllegalStateException("Unknown wire type $wireType")
             }
         }
     }
 
-    // https://cs.android.com/android/platform/superproject/main/+/main:system/apex/libs/libapexutil/apexutil.cpp
     private val apexInfos: List<Pair<String, Long>> by lazy {
         val results = mutableListOf<Pair<String, Long>>()
         val apexRoot = File("/apex")
@@ -443,22 +757,14 @@ object AndroidDeviceUtils {
             return@lazy emptyList()
         }
 
-        // Logic from: GetActivePackages in apexutil.cpp
         apexRoot.listFiles()?.forEach { file ->
             if (!file.isDirectory) return@forEach
             val name = file.name
 
-            // 1. Ignore "." (and implicitly "..")
             if (name.startsWith(".")) return@forEach
-
-            // 2. Ignore directories containing '@' (active mounts usually don't have version in
-            // path)
             if (name.contains("@")) return@forEach
-
-            // 3. Ignore "sharedlibs"
             if (name == "sharedlibs") return@forEach
 
-            // 4. Parse apex_manifest.pb
             val manifestFile = File(file, "apex_manifest.pb")
             if (manifestFile.exists()) {
                 runCatching {
@@ -469,68 +775,81 @@ object AndroidDeviceUtils {
             }
         }
 
-        // Ensure uniqueness (though filesystem scan usually prevents exact dupes,
-        // strictly speaking we want to behave like a Map keyed by package name)
         results.distinctBy { it.first }
     }
 
-    // https://cs.android.com/android/platform/superproject/main/+/main:system/security/keystore2/src/maintenance.rs
     val moduleHash: ByteArray by lazy {
         DeviceAttestationService.CachedAttestationData?.moduleHash
+            ?.also { SystemLogger.debug { "module-hash source=cache hash=${it.toHex().take(8)}" } }
+            ?: supplementaryModuleHash()?.also {
+                SystemLogger.debug { "module-hash source=framework-api hash=${it.toHex().take(8)}" }
+            }
             ?: runCatching {
-                    // 1. Create a container to hold the sort key (name encoded) and the full data
-                    // (sequence encoded)
-                    data class ModuleEntry(
-                        val nameEncoded: ByteArray, // The sort key
-                        val fullEncoded: ByteArray, // The data to hash
-                    )
+                    data class ModuleEntry(val nameEncoded: ByteArray, val fullEncoded: ByteArray)
 
                     val modules =
                         apexInfos.map { (packageName, versionCode) ->
-                            // Create the components
                             val nameOctet = DEROctetString(packageName.toByteArray(Charsets.UTF_8))
                             val versionInt = ASN1Integer(versionCode)
 
-                            // Create the Sequence: SEQUENCE { packageName, version }
                             val vec = ASN1EncodableVector()
                             vec.add(nameOctet)
                             vec.add(versionInt)
                             val sequence = DERSequence(vec)
 
-                            // We store the encoded name separately because Rust sorts ONLY by this
+                            // AOSP sorts by encoded name only, not full sequence
                             ModuleEntry(
                                 nameEncoded = nameOctet.encoded,
                                 fullEncoded = sequence.encoded,
                             )
                         }
 
-                    // 2. Sort manually based on the encoded Package Name (lexicographically)
-                    // This mimics the Rust 'impl DerOrd for ModuleInfo' which delegates to
-                    // 'self.name'
                     val sortedModules =
                         modules.sortedWith { m1, m2 ->
                             compareByteArrays(m1.nameEncoded, m2.nameEncoded)
                         }
 
-                    // 3. Concatenate the full sequences in the specific sorted order
                     val payloadStream = ByteArrayOutputStream()
                     sortedModules.forEach { payloadStream.write(it.fullEncoded) }
                     val payload = payloadStream.toByteArray()
 
-                    // 4. Wrap manually in a DER SET tag (0x31)
-                    // We cannot use DERSet(vector) because it would re-sort incorrectly.
+                    // Wrap in DER SET tag manually — DERSet() re-sorts by full encoding
                     val finalDerSet = encodeAsDerSet(payload)
 
-                    // 5. Compute SHA-256
                     MessageDigest.getInstance("SHA-256").digest(finalDerSet)
                 }
+                .onSuccess {
+                    SystemLogger.debug { "module-hash source=rederive hash=${it.toHex().take(8)}" }
+                }
+                .onFailure { SystemLogger.debug { "module-hash source=zero hash=00000000" } }
                 .getOrElse {
                     SystemLogger.error("Failed to compute module hash.", it)
                     ByteArray(32)
                 }
     }
 
-    /** Compares two byte arrays lexicographically (unsigned). */
+    /**
+     * Reads the module-hash DER pre-image straight from the framework's own KeyStoreManager and
+     * SHA-256's it, so the value byte-matches what a verifier derives from the same
+     * getSupplementaryAttestationInfo call. Returns null on any failure (e.g. the API is
+     * unreachable from this process) so the caller falls back to local re-derivation.
+     */
+    private fun supplementaryModuleHash(): ByteArray? =
+        runCatching {
+                // @SystemApi surface added in Android 16, absent from the compile SDK, so reflect.
+                val managerClass = Class.forName("android.security.keystore.KeyStoreManager")
+                val manager = managerClass.getMethod("getInstance").invoke(null)
+                // MODULE_HASH is the KeyMint tag (TagType.BYTES | 724 = 0x900002D4), read from the
+                // framework so it matches the verifier's argument exactly.
+                val moduleHashTag = managerClass.getField("MODULE_HASH").getInt(null)
+                val derPreImage =
+                    managerClass
+                        .getMethod("getSupplementaryAttestationInfo", Int::class.java)
+                        .invoke(manager, moduleHashTag) as ByteArray
+                MessageDigest.getInstance("SHA-256").digest(derPreImage)
+            }
+            .getOrNull()
+
     private fun compareByteArrays(a: ByteArray, b: ByteArray): Int {
         val length = minOf(a.size, b.size)
         for (i in 0 until length) {
@@ -543,31 +862,25 @@ object AndroidDeviceUtils {
         return a.size - b.size
     }
 
-    /** Manually wraps the payload in an ASN.1 SET (0x31) tag with correct length encoding. */
     private fun encodeAsDerSet(payload: ByteArray): ByteArray {
         val out = ByteArrayOutputStream()
-        out.write(0x31) // ASN.1 Tag for SET
+        out.write(0x31)
         writeDerLength(out, payload.size)
         out.write(payload)
         return out.toByteArray()
     }
 
-    /** Writes the ASN.1 length field to the stream. */
     private fun writeDerLength(out: ByteArrayOutputStream, length: Int) {
         if (length < 128) {
-            // Short form
             out.write(length)
         } else {
-            // Long form
             var size = length
             val bytes = ArrayList<Byte>()
             while (size > 0) {
                 bytes.add((size and 0xFF).toByte())
                 size = size ushr 8
             }
-            // First byte: 0x80 | number of length bytes
             out.write(0x80 or bytes.size)
-            // Write length bytes in big-endian (reverse of how we extracted them)
             for (i in bytes.indices.reversed()) {
                 out.write(bytes[i].toInt())
             }

@@ -109,17 +109,21 @@ abstract class BinderInterceptor : Binder() {
      * `handlePostTransact`).
      */
     final override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
-        // The native hook prepends a transaction ID to the data parcel.
         val txId = data.readLong()
         val result =
-            when (code) {
-                // These codes are defined in the native layer to distinguish hook types.
-                PRE_TRANSACT_CODE -> handlePreTransact(txId, data)
-                POST_TRANSACT_CODE -> handlePostTransact(txId, data)
-                else -> return super.onTransact(code, data, reply, flags)
+            try {
+                when (code) {
+                    PRE_TRANSACT_CODE -> handlePreTransact(txId, data)
+                    POST_TRANSACT_CODE -> handlePostTransact(txId, data)
+                    else -> return super.onTransact(code, data, reply, flags)
+                }
+            } catch (e: Throwable) {
+                SystemLogger.error(
+                    "[TX_ID: $txId] Interceptor exception, falling through to HAL",
+                    e,
+                )
+                TransactionResult.ContinueAndSkipPost
             }
-
-        // The reply parcel is guaranteed to be non-null for our custom transactions.
         writeResultToReply(result, reply!!)
         return true
     }
@@ -220,7 +224,11 @@ abstract class BinderInterceptor : Binder() {
         }
     }
 
-    /** Helper function for consistent logging of intercepted transactions. */
+    /**
+     * Logs an intercepted transaction. For a targeted UID every transaction — whether we intercept
+     * or merely observe it — is recorded on that UID's own diagnostic plane, so its keystore
+     * timeline reads cleanly end to end. Untargeted UIDs get a single terse, rate-limited line.
+     */
     protected fun logTransaction(
         txId: Long,
         methodName: String,
@@ -228,15 +236,14 @@ abstract class BinderInterceptor : Binder() {
         callingPid: Int,
         skipPost: Boolean = false,
     ) {
-        val isIntercepting = !skipPost && !ConfigurationManager.shouldSkipUid(callingUid)
-        val action = if (isIntercepting) "Intercept" else "Observe"
-        val packages = ConfigurationManager.getPackagesForUid(callingUid).joinToString()
-        val message =
-            "[TX_ID: $txId] $action $methodName for packages=[$packages] (uid=$callingUid, pid=$callingPid)"
-        if (isIntercepting) {
-            SystemLogger.debug(message)
-        } else {
-            SystemLogger.verbose(message)
+        if (SystemLogger.isUidLogged(callingUid)) {
+            val action = if (skipPost) "observe" else "intercept"
+            SystemLogger.uidLog(callingUid, txId, "tx", "$methodName action=$action pid=$callingPid")
+            return
+        }
+        SystemLogger.verbose {
+            val packages = ConfigurationManager.getPackagesForUid(callingUid).joinToString()
+            "[TX_ID: $txId] Observe $methodName for packages=[$packages] (uid=$callingUid, pid=$callingPid)"
         }
     }
 
@@ -293,17 +300,31 @@ abstract class BinderInterceptor : Binder() {
             }
         }
 
-        /** Uses the backdoor binder to register an interceptor for a specific target service. */
-        fun register(backdoor: IBinder, target: IBinder, interceptor: BinderInterceptor) {
+        fun register(
+            backdoor: IBinder,
+            target: IBinder,
+            interceptor: BinderInterceptor,
+            filteredCodes: IntArray = intArrayOf(),
+        ): Boolean {
             val data = Parcel.obtain()
             val reply = Parcel.obtain()
-            try {
+            return try {
                 data.writeStrongBinder(target)
                 data.writeStrongBinder(interceptor)
-                backdoor.transact(REGISTER_INTERCEPTOR_CODE, data, reply, 0)
-                SystemLogger.info("Registered interceptor for target: $target")
+                data.writeInt(filteredCodes.size)
+                for (code in filteredCodes) data.writeInt(code)
+                val ok = backdoor.transact(REGISTER_INTERCEPTOR_CODE, data, reply, 0)
+                if (ok) {
+                    SystemLogger.info(
+                        "Registered interceptor for target: $target (${filteredCodes.size} filtered codes)"
+                    )
+                } else {
+                    SystemLogger.error("Register transact returned false for target: $target")
+                }
+                ok
             } catch (e: Exception) {
                 SystemLogger.error("Failed to register binder interceptor.", e)
+                false
             } finally {
                 data.recycle()
                 reply.recycle()
