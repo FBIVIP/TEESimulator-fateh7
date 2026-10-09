@@ -81,14 +81,14 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: TEESimulator-RS-release-zip
-          path: out/TEESimulator-RS-*-Release.zip
+          path: out/*-Release.zip
           retention-days: 30
           compression-level: 0
 
       - uses: actions/upload-artifact@v4
         with:
           name: TEESimulator-RS-debug-zip
-          path: out/TEESimulator-RS-*-Debug.zip
+          path: out/*-Debug.zip
           retention-days: 7
           compression-level: 0
 
